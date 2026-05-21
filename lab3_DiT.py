@@ -718,45 +718,50 @@ class FourierEncoder(nn.Module):
         super().__init__()
         assert dim % 2 == 0
         self.half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(1, self.half_dim))
+        # learnable w_i; initialized as random Gaussian
+        self.weights = nn.Parameter(torch.randn(1, self.half_dim)) # [1 half_dim]
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
-        - t: b
+        - t: [b]
         Returns:
-        - embeddings: b d
+        - embeddings: [b dim]
         """
         # Step 1: compute frequencies f_i = 2 * pi * w_i * t
-        t = t.view(-1, 1) # b 1
-        freqs = t * self.weights * 2 * math.pi # b hd
+        t = t.view(-1, 1) # [b] -> [b 1]
+        freqs = t * self.weights * 2 * math.pi # [b half_dim]
 
         # Step 2: compute sin(f_i) and cos(f_i)
-        sin_embed = torch.sin(freqs) # b hd
-        cos_embed = torch.cos(freqs) # b hd
+        sin_embed = torch.sin(freqs) # [b half_dim]
+        cos_embed = torch.cos(freqs) # [b half_dim]
 
         # Step 3: Concatenate and return
-        return torch.cat([sin_embed, cos_embed], dim=-1) * math.sqrt(2) # b d
+        return torch.cat([sin_embed, cos_embed], dim=-1) * math.sqrt(2) # [b dim]
 
 class Patchifier(nn.Module):
-  def __init__(self, img_size: int, patch_size: int, c_in: int, dim: int):
+  def __init__(self, img_h: int, img_w: int, patch_size: int, c_in: int, dim: int):
     super().__init__()
-    assert img_size % patch_size == 0, "Image size must be divisible by patch size"
+    assert img_h % patch_size == 0, "Image size must be divisible by patch size"
+    assert img_w % patch_size == 0, "Image size must be divisible by patch size"
 
     self.net = nn.Sequential(
         # Initial convolution
+        # kernel_size=stride=patch_size to create non-overlapping patches
+        # each patch outputs dim (latent dimension) channels
         nn.Conv2d(c_in, dim, kernel_size=patch_size, stride=patch_size),
 
-        # Patchify
+        # [b, dim, num_patches_h, num_patches_w] -> [b, num_patches, dim]
+        # num_tokens = num_patches = (img_h / patch_size) * (img_w / patch_size)
         Rearrange("b d h w -> b (h w) d"),
     )
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     """
     Args:
-    - x: (bs, 1, img_size, img_size)
+    - x: (b, c, h, w)
     Returns:
-    - x: (bs, 1, img_size, img_size)
+    - x: [b, num_patches, dim]
     """
     return self.net(x)
 
@@ -948,7 +953,8 @@ class DiffusionTransformerFlowModel(ConditionalVectorField):
 
       # 1. Construct patchifier
       self.patchifier = Patchifier(
-          img_size=img_size,
+          img_h=img_size,
+          img_w=img_size,
           patch_size=patch_size,
           c_in=c,
           dim=dim
