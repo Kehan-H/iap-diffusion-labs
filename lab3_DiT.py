@@ -740,267 +740,284 @@ class FourierEncoder(nn.Module):
         return torch.cat([sin_embed, cos_embed], dim=-1) * math.sqrt(2) # [b dim]
 
 class Patchifier(nn.Module):
-  def __init__(self, img_h: int, img_w: int, patch_size: int, c_in: int, dim: int):
-    super().__init__()
-    assert img_h % patch_size == 0, "Image size must be divisible by patch size"
-    assert img_w % patch_size == 0, "Image size must be divisible by patch size"
+    def __init__(self, img_h: int, img_w: int, patch_size: int, c_in: int, dim: int):
+        super().__init__()
+        assert img_h % patch_size == 0, "image height must be divisible by patch size"
+        assert img_w % patch_size == 0, "image width must be divisible by patch size"
 
-    self.net = nn.Sequential(
-        # Initial convolution
-        # kernel_size=stride=patch_size to create non-overlapping patches
-        # each patch outputs dim (latent dimension) channels
-        nn.Conv2d(c_in, dim, kernel_size=patch_size, stride=patch_size),
+        self.net = nn.Sequential(
+            # Initial convolution
+            # kernel_size=stride=patch_size to create non-overlapping patches
+            # each patch outputs dim (latent dimension) channels
+            nn.Conv2d(c_in, dim, kernel_size=patch_size, stride=patch_size),
 
-        # [b, dim, num_patches_h, num_patches_w] -> [b, num_patches, dim]
-        # num_tokens = num_patches = (img_h / patch_size) * (img_w / patch_size)
-        Rearrange("b d h w -> b (h w) d"),
-    )
+            # [b, dim, num_patches_h, num_patches_w] -> [b, num_patches, dim]
+            # num_patches (num_tokens) = (img_h // patch_size) * (img_w // patch_size)
+            Rearrange("b d h w -> b (h w) d"),
+        )
 
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-    - x: (b, c, h, w)
-    Returns:
-    - x: [b, num_patches, dim]
-    """
-    return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: (b, c, h, w)
+        Returns:
+        - x: [b, num_patches, dim]
+        """
+        return self.net(x)
 
 class MHA(nn.Module):
-  """
-  Multi-headed self-attention
-  """
-  def __init__(self, dim: int, heads: int):
-    super().__init__()
-    assert dim % heads == 0
-
-    self.scale = (dim // heads) ** -0.5
-    self.qkv = nn.Linear(dim, dim * 3)
-    self.fold_heads = Rearrange('b n (h d) -> (b h) n d', h=heads)
-    self.unfold_heads = Rearrange('(b h) n d -> b n (h d)', h=heads)
-    self.out = nn.Linear(dim, dim)
-
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
     """
-    Args:
-    - x: b n d
-    Returns:
-    - x: b n d
+    Multi-headed self-attention
     """
-    # Compute queries, keys, and values
-    q, k, v = self.qkv(x).chunk(3, dim=-1) # b n (h d)
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        assert dim % num_heads == 0 # head_dim = dim // num_heads
 
-    # Fold head into batch dimension
-    q, k, v = map(self.fold_heads, (q, k, v)) # (b h) n d
+        # scale for numerically stable attention scores: QK^T / sqrt(head_dim)
+        self.scale = (dim // num_heads) ** -0.5
+        # Q = X W_Q, K = X W_K, V = X W_V; (b, num_patches, dim) -> (b, num_patches, 3 * dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        # splits latent dim into multiple heads; stacked along b as an implementation trick
+        # [b num_patches dim] -> [b*h num_patches head_dim]
+        self.fold_heads = Rearrange('b n (h hdim) -> (b h) n hdim', h=num_heads)
+        # [b*h num_patches head_dim] -> [b num_patches dim]
+        self.unfold_heads = Rearrange('(b h) n hdim -> b n (h hdim)', h=num_heads)
+        # output layer that mixes all heads
+        self.out = nn.Linear(dim, dim)
 
-    # Compute attention
-    qk = torch.einsum('bid,bjd->bij', q, k) * self.scale # (b h) n n
-    attn = torch.softmax(qk, dim=-1) # (b h) n n
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: [b n dim], where n = num tokens/patches and dim = latent dimension
+        Returns:
+        - x: b n dim]
+        """
+        # Compute queries, keys, and values
+        # Q = X W_Q, K = X W_K, V = X W_V
+        q, k, v = self.qkv(x).chunk(3, dim=-1) # 3 tensors, each [b, n, dim]
 
-    # Combine with values
-    x = torch.einsum('bij,bjd->bid', attn, v) # (b h) n d
+        # Fold head into batch dimension
+        q, k, v = map(self.fold_heads, (q, k, v)) # [b n dim] -> [b*h n head_dim] for q, k, v
 
-    # Unfold heads
-    x = self.unfold_heads(x) # b n (h d)
+        # Compute attention
+        qk = torch.einsum('bid,bjd->bij', q, k) * self.scale # [b*h n n]; qk[b,i,j] = \sum_d q[b,i,d] * k[b,j,d]
+        attn = torch.softmax(qk, dim=-1) # [b*h n n]; attn[b,i,j] = exp(qk[b,i,j]) / sum_j' exp(qk[b,i,j'])
 
-    # Pass throuh FF and return
-    return self.out(x)
+        # Combine with values: x[b, i, d] = \sum_j attn[b, i, j] * v[b, j, d]
+        x = torch.einsum('bij,bjd->bid', attn, v) # [b*h n head_dim]
 
+        # Unfold heads
+        x = self.unfold_heads(x) # [b*h n head_dim] -> [b n h*head_dim]
+
+        # mixes all heads and return (W_O)
+        return self.out(x)
+
+# modulate x by per-channel scale/shift obtained from adaLN
+# used for time conditioning in DiffusionTransformerLayer
 def modulate(x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """
     Args:
-    - x: b n d
-    - scale: b n d
-    - bias: b n d
+    - x: [b n dim]
+    - scale: [b 1 dim]; broadcastable to [b n dim]
+    - bias: [b 1 dim]; broadcastable to [b n dim]
     Returns:
-    - x: b n d
+    - x: [b n dim]
     """
     return x * (1 + scale) + bias
 
 class DiffusionTransformerLayer(nn.Module):
-  def __init__(
-      self,
-      dim: int,
-      heads: int,
-  ):
-    """
-    Args:
-    - n_tokens: sequence length (for sake of positional embeddings)
-    - dim: dimension of hidden layers
-    - heads: number of attention heads
-    """
-    super().__init__()
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+    ):
+        """
+        Args:
+        - n_tokens: sequence length (for sake of positional embeddings)
+        - dim: dimension of hidden layers
+        - heads: number of attention heads
+        """
+        super().__init__()
 
-    # Normalization
-    self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
-    self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
-    self.ada_ln = nn.Sequential(
-        nn.RMSNorm(dim, elementwise_affine=False),
-        nn.Linear(dim, dim * 6)
-    )
+        # Normalization
+        self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
+        # learnable AdaLN (adaptive layer normalization) for time conditioning; 
+        # outputs 6 vectors for modulating attention and FF
+        self.ada_ln = nn.Sequential(
+            nn.RMSNorm(dim, elementwise_affine=False),
+            nn.Linear(dim, dim * 6)
+        )
 
-    # Initialize conditioning to zero - stabilizes residual connection!
-    nn.init.zeros_(self.ada_ln[1].weight)
-    nn.init.zeros_(self.ada_ln[1].bias)
+        # Initialize conditioning to zero - stabilizes residual connection!
+        nn.init.zeros_(self.ada_ln[1].weight)
+        nn.init.zeros_(self.ada_ln[1].bias)
 
-    # Attention
-    self.attn = MHA(dim, heads)
+        # Attention
+        self.attn = MHA(dim, heads)
 
-    # Feedforward
-    self.ff = MLP([dim, 4 * dim, dim])
+        # Feedforward
+        self.ff = MLP([dim, 4 * dim, dim])
 
-  def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-    - x: b n d
-    - c: b d
-    Returns:
-    - x: b n d
-    """
-    # Compute conditioning gating, scaling, and bias
-    c = rearrange(self.ada_ln(c), 'b d -> b 1 d') # b 1 d
-    attn_scale, attn_bias, attn_gate, ff_scale, ff_bias, ff_gate = c.chunk(6, dim=-1)
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: b n d
+        - c: [b dim]; conditioning vector (e.g., time embedding)
+        Returns:
+        - x: b n d
+        """
+        # Compute conditioning gating, scaling, and bias
+        c = rearrange(self.ada_ln(c), 'b d -> b 1 d') # [b 1 dim*6]
+        attn_scale, attn_bias, attn_gate, ff_scale, ff_bias, ff_gate = c.chunk(6, dim=-1) # [b 1 dim] * 6
 
-    # Attention + FF
-    x = x + attn_gate * self.attn(
-      modulate(self.norm1(x), attn_scale, attn_bias)
-    )
-    x = x + ff_gate * self.ff(
-      modulate(self.norm2(x), ff_scale, ff_bias)
-    )
-    return x
+        # time-conditioned attention update
+        x = x + attn_gate * self.attn(
+        modulate(self.norm1(x), attn_scale, attn_bias)
+        )
+        # time-conditioned FF/MLP update
+        x = x + ff_gate * self.ff(
+        modulate(self.norm2(x), ff_scale, ff_bias)
+        )
+        return x
 
+# DiT block in the note; extension of https://arxiv.org/abs/2212.09748
 class DiffusionTransformer(nn.Module):
-  def __init__(
-      self,
-      depth: int,
-      n_tokens: int,
-      dim: int,
-      **layer_kwargs,
-  ):
-    """
-    Args:
-    - n_tokens: sequence length (for sake of positional embeddings)
-    - dim: dimension of hidden layers
-    - heads: number of attention heads
-    - depth: number of layers
-    """
-    super().__init__()
-    self.layers = nn.ModuleList([])
-    for _ in range(depth):
-      self.layers.append(DiffusionTransformerLayer(dim=dim, **layer_kwargs))
+    def __init__(
+        self,
+        depth: int,
+        n_tokens: int,
+        dim: int,
+        **layer_kwargs,
+    ):
+        """
+        Args:
+        - n_tokens: sequence length (for sake of positional embeddings)
+        - dim: dimension of hidden layers
+        - heads: number of attention heads
+        - depth: number of layers
+        """
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(DiffusionTransformerLayer(dim=dim, **layer_kwargs))
 
-    # Positional encodings
-    self.pos_encodings = nn.Parameter(torch.randn(n_tokens, dim))
+        # Positional encodings for patches (learnable)
+        self.pos_encodings = nn.Parameter(torch.randn(n_tokens, dim)) # [n_tokens, dim]
 
-  def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-    - x: b n d
-    - c: b d
-    Returns:
-    - x: b n d
-    """
-    x = x + self.pos_encodings.unsqueeze(0)
-    for layer in self.layers:
-      x = layer(x, c)
-    return x
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: b n d
+        - c: b d
+        Returns:
+        - x: b n d
+        """
+        x = x + self.pos_encodings.unsqueeze(0)
+        for layer in self.layers:
+            x = layer(x, c)
+        return x
 
 class Depatchifier(nn.Module):
-  def __init__(self, img_size: int, patch_size: int, dim: int, final_dim: int, c_out: int):
-      super().__init__()
-      self.patch_size = patch_size
-      assert img_size % patch_size == 0, "Image size must be divisible by patch size"
-      h = w = img_size // patch_size
+    def __init__(self, img_h: int, img_w: int, patch_size: int, dim: int, final_dim: int, c_out: int):
+        super().__init__()
+        self.patch_size = patch_size
+        assert img_h % patch_size == 0, "image height must be divisible by patch size"
+        assert img_w % patch_size == 0, "image width must be divisible by patch size"
 
+        h = img_h // patch_size     # number of patches along height
+        w = img_w // patch_size     # number of patches along width
 
-      self.net = nn.Sequential(
-          # Norm + MLP
-          nn.RMSNorm(dim, elementwise_affine=False),
-          MLP([dim, 4*dim, final_dim * patch_size ** 2]),
+        self.net = nn.Sequential(
+            # Norm + MLP
+            nn.RMSNorm(dim, elementwise_affine=False),
+            MLP([dim, 4*dim, final_dim * patch_size ** 2]),
 
-          # Depatchify
-          Rearrange("b (h w) (f ph pw) -> b f (h ph) (w pw)", h=h, w=w, f=final_dim, ph=patch_size, pw=patch_size),
+            # Depatchify
+            Rearrange("b (h w) (f ph pw) -> b f (h ph) (w pw)", h=h, w=w, f=final_dim, ph=patch_size, pw=patch_size),
 
-          # Final convolution
-          nn.Conv2d(final_dim, c_out, kernel_size=3, padding=1)
-      )
+            # Final convolution
+            nn.Conv2d(final_dim, c_out, kernel_size=3, padding=1)
+        )
 
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-    - x: b n d
-    Returns:
-    - x: b 1 32 32
-    """
-    return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: [b n dim]
+        Returns:
+        - x: [b c img_h img_w]
+        """
+        return self.net(x)
   
 class DiffusionTransformerFlowModel(ConditionalVectorField):
-  def __init__(
-      self,
-      img_size: int = 32,
-      patch_size: int = 8,
-      num_layers: int = 12,
-      c: int = 1,
-      dim: int = 256,
-      heads: int = 4,
-      final_dim: int = 10,
-      n_classes: int = 11,
+    def __init__(
+          self,
+          img_h: int = 32,
+          img_w: int = 32,
+          patch_size: int = 8,
+          num_layers: int = 12,
+          c: int = 1,
+          dim: int = 256,
+          heads: int = 4,
+          final_dim: int = 10,
+          n_classes: int = 11,
     ):
-      super().__init__()
-      # 0. Construct time_embedder and y_embedder
-      self.time_embedder = FourierEncoder(dim)
-      self.y_embedder = nn.Embedding(num_embeddings = n_classes, embedding_dim = dim)
+        super().__init__()
+        # 0. Construct time_embedder and y_embedder
+        self.time_embedder = FourierEncoder(dim)
+        self.y_embedder = nn.Embedding(num_embeddings = n_classes, embedding_dim = dim)
 
-      # 1. Construct patchifier
-      self.patchifier = Patchifier(
-          img_h=img_size,
-          img_w=img_size,
-          patch_size=patch_size,
-          c_in=c,
-          dim=dim
+        # 1. Construct patchifier
+        self.patchifier = Patchifier(
+            img_h=img_h,
+            img_w=img_w,
+            patch_size=patch_size,
+            c_in=c,
+            dim=dim
         )
 
-      # 2. Construct DiT
-      n_tokens = (img_size // patch_size) ** 2
-      self.dit = DiffusionTransformer(
-          depth=num_layers,
-          n_tokens=n_tokens,
-          dim=dim,
-          heads=heads,
-      )
-
-      # 3. Construct de-patchifier
-      self.depatchifier = Depatchifier(
-          img_size=img_size,
-          patch_size=patch_size,
-          dim=dim,
-          final_dim=final_dim,
-          c_out=c
+        # 2. Construct DiT
+        n_tokens = (img_h // patch_size) * (img_w // patch_size)
+        self.dit = DiffusionTransformer(
+            depth=num_layers,
+            n_tokens=n_tokens,
+            dim=dim,
+            heads=heads,
         )
 
-  def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """
-    Args:
-    - x: b 1 32 32
-    - t: b 1 1 1
-    - c: b 1 1 1
-    Returns:
-    - u_t^theta(x|y): b 1 32 32
-    """
-    # 1. Embed time and y
-    t_embed = self.time_embedder(t) # b d
-    y_embed = self.y_embedder(y) # b d
+        # 3. Construct de-patchifier
+        self.depatchifier = Depatchifier(
+            img_h=img_h,
+            img_w=img_w,
+            patch_size=patch_size,
+            dim=dim,
+            final_dim=final_dim,
+            c_out=c
+        )
 
-    # 2. Patchify
-    x = self.patchifier(x) # b n d
+    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+        - x: [b c img_h img_w]
+        - t: [b]
+        - y: [b]
+        Returns:
+        - u_t^theta(x|y): [b c img_h img_w]
+        """
+        # 1. Embed time and y
+        t_embed = self.time_embedder(t) # [b dim]
+        y_embed = self.y_embedder(y) # [b dim]
 
-    # 3. Pass through DiT
-    x = self.dit(x, t_embed + y_embed) # b d
+        # 2. Patchify
+        x = self.patchifier(x) # [b n dim]
 
-    # 4. Depatchify
-    x = self.depatchifier(x) # b 1 32 32
+        # 3. Pass through DiT
+        x = self.dit(x, t_embed + y_embed) # [b dim]
 
-    return x
+        # 4. Depatchify
+        x = self.depatchifier(x) # [b c img_h img_w]
+
+        return x
   
 ##################
 # Training utils #
@@ -1008,49 +1025,49 @@ class DiffusionTransformerFlowModel(ConditionalVectorField):
 
 @torch.no_grad()
 def visualize_output(model, path, samples_per_class: int = 10, num_timesteps: int = 100, guidance_scales: List[float] = [1.0, 3.0, 5.0], save_path: Optional[str] = None, use_tqdm: bool = True):
-  # Graph
-  fig, axes = plt.subplots(1, len(guidance_scales), figsize=(10 * len(guidance_scales), 10))
+    # Graph
+    fig, axes = plt.subplots(1, len(guidance_scales), figsize=(10 * len(guidance_scales), 10))
 
-  for idx, w in enumerate(guidance_scales):
-      # Setup ode and simulator
-      ode = CFGVectorFieldODE(model, guidance_scale=w, null_label=10)
-      simulator = EulerSimulator(ode)
+    for idx, w in enumerate(guidance_scales):
+        # Setup ode and simulator
+        ode = CFGVectorFieldODE(model, guidance_scale=w, null_label=10)
+        simulator = EulerSimulator(ode)
 
-      # Sample initial conditions
-      y = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int64).repeat_interleave(samples_per_class).to(device)
-      num_samples = y.shape[0]
-      x0 = path.p_simple.sample(num_samples) # (num_samples, 1, 32, 32)
+        # Sample initial conditions
+        y = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int64).repeat_interleave(samples_per_class).to(device)
+        num_samples = y.shape[0]
+        x0 = path.p_simple.sample(num_samples) # (num_samples, 1, 32, 32)
 
-      # Simulate
-      ts = torch.linspace(0,0.999,num_timesteps).view(1, -1, 1, 1, 1).expand(num_samples, -1, 1, 1, 1).to(device)
-      x1 = simulator.simulate(x0, ts, y=y, use_tqdm=use_tqdm)
+        # Simulate
+        ts = torch.linspace(0,0.999,num_timesteps).view(1, -1, 1, 1, 1).expand(num_samples, -1, 1, 1, 1).to(device)
+        x1 = simulator.simulate(x0, ts, y=y, use_tqdm=use_tqdm)
 
-      # Plot
-      v_min, v_max = x1.min(), x1.max()
-      x1 = (x1 - v_min) / (v_max - v_min)
-      grid = make_grid(x1, nrow=samples_per_class, normalize=True, value_range=(0,1))
-      axes[idx].imshow(grid.permute(1, 2, 0).cpu(), cmap="gray")
-      axes[idx].axis("off")
-      axes[idx].set_title(f"Guidance: $w={w:.1f}$", fontsize=25)
+        # Plot
+        v_min, v_max = x1.min(), x1.max()
+        x1 = (x1 - v_min) / (v_max - v_min)
+        grid = make_grid(x1, nrow=samples_per_class, normalize=True, value_range=(0,1))
+        axes[idx].imshow(grid.permute(1, 2, 0).cpu(), cmap="gray")
+        axes[idx].axis("off")
+        axes[idx].set_title(f"Guidance: $w={w:.1f}$", fontsize=25)
 
-  # Save
-  if save_path is not None:
-      plt.savefig(save_path)
-      plt.close()
-  else:
-    plt.show()
+    # Save
+    if save_path is not None:
+        plt.savefig(save_path)
+        plt.close()
+    else:
+        plt.show()
 
 class MNISTCFGTrainer(CFGTrainer):
-  '''
-  CFG Trainer with MNIST-specific callback
-  '''
-  def checkpoint(self, step: int):
-    # Save model
-    torch.save(self.model.state_dict(), os.path.join(self.output_dir, f'step_{step:6d}_model.pt'))
-    torch.save(self.opt.state_dict(), os.path.join(self.output_dir, f'step_{step:6d}_opt.pt'))
+    '''
+    CFG Trainer with MNIST-specific callback
+    '''
+    def checkpoint(self, step: int):
+        # Save model
+        torch.save(self.model.state_dict(), os.path.join(self.output_dir, f'step_{step:6d}_model.pt'))
+        torch.save(self.opt.state_dict(), os.path.join(self.output_dir, f'step_{step:6d}_opt.pt'))
 
-    # Save output visualization
-    visualize_output(self.model, self.path, save_path=os.path.join(self.output_dir, f'step_{step:6d}_output.png'), use_tqdm=False)
+        # Save output visualization
+        visualize_output(self.model, self.path, save_path=os.path.join(self.output_dir, f'step_{step:6d}_output.png'), use_tqdm=False)
 
 #################
 # Training code #
@@ -1068,7 +1085,8 @@ path = GaussianConditionalProbabilityPath(
 
 # Initialize model
 dit = DiffusionTransformerFlowModel(
-    img_size = 32,
+    img_h = 32,
+    img_w = 32,
     patch_size = 4,
     num_layers = 8,
     c = 1,
